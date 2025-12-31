@@ -11,6 +11,7 @@ import io
 import aiohttp
 
 # --- CONFIGURATION ---
+# Ensure your Token is set in the environment secrets
 TOKEN = os.environ.get('TOKEN')
 
 # --- DATABASE SETUP ---
@@ -27,16 +28,6 @@ c.execute("""CREATE TABLE IF NOT EXISTS global_config (
              window_open INTEGER DEFAULT 1
              )""")
 
-# --- DATABASE MIGRATION ---
-try:
-    c.execute("ALTER TABLE global_config ADD COLUMN free_agent_role_id INTEGER")
-except sqlite3.OperationalError:
-    pass 
-try:
-    c.execute("ALTER TABLE global_config ADD COLUMN window_open INTEGER DEFAULT 1")
-except sqlite3.OperationalError:
-    pass
-
 # 2. Teams Table
 # Columns: team_role_id, logo, roster_limit, transaction_image
 c.execute("""CREATE TABLE IF NOT EXISTS teams (
@@ -46,11 +37,18 @@ c.execute("""CREATE TABLE IF NOT EXISTS teams (
              transaction_image TEXT
              )""")
 
-# NEW MIGRATION: Add transaction_image column to teams table
+# --- DATABASE MIGRATIONS (Auto-Fixes for old DBs) ---
+try:
+    c.execute("ALTER TABLE global_config ADD COLUMN free_agent_role_id INTEGER")
+except sqlite3.OperationalError: pass 
+
+try:
+    c.execute("ALTER TABLE global_config ADD COLUMN window_open INTEGER DEFAULT 1")
+except sqlite3.OperationalError: pass
+
 try:
     c.execute("ALTER TABLE teams ADD COLUMN transaction_image TEXT")
-except sqlite3.OperationalError:
-    pass
+except sqlite3.OperationalError: pass
 
 # 3. Free Agents Table
 c.execute("""CREATE TABLE IF NOT EXISTS free_agents (
@@ -84,7 +82,7 @@ def find_user_team(member):
     for role in member.roles:
         data = get_team_data(role.id)
         if data:
-            # Handle potential missing column in very old data, though migration should fix it
+            # Handle potential missing column index if DB is weird, though migration fixes it
             trans_img = data[3] if len(data) > 3 else None
             return (role, data[1], data[2], trans_img) 
     return None
@@ -139,9 +137,9 @@ def format_roster_list(members, mgr_id, asst_id):
         formatted_list.append(name)
     return formatted_list
 
-# --- NEW IMAGE GENERATION FUNCTION ---
+# --- IMAGE GENERATION FUNCTION ---
 async def generate_signing_card(player, team_name, team_color):
-    """Generates a Welcome Card for signings"""
+    """Generates a Python-based Welcome Card for signings (Default Behavior)"""
     # 1. Canvas
     bg_color = team_color.to_rgb()
     if bg_color == (0, 0, 0): 
@@ -170,8 +168,9 @@ async def generate_signing_card(player, team_name, team_color):
 
     # 3. Text
     try:
-        font_large = ImageFont.truetype("font.ttf", 60)
-        font_small = ImageFont.truetype("font.ttf", 40)
+        # Tries to find a font, falls back to default if not found
+        font_large = ImageFont.truetype("arial.ttf", 60)
+        font_small = ImageFont.truetype("arial.ttf", 40)
     except:
         font_large = ImageFont.load_default()
         font_small = ImageFont.load_default()
@@ -253,8 +252,13 @@ class TransferView(discord.ui.View):
 
             embed = create_transaction_embed(self.guild, "Official Transfer", desc, discord.Color.purple(), self.to_team, self.logo, self.to_manager, len(self.to_team.members), limit)
             
+            # --- CUSTOM IMAGE LOGIC FOR TRANSFER ---
             if custom_image:
                 embed.set_image(url=custom_image)
+            else:
+                # Optional: You could generate a card here too, but for transfers usually plain embeds are fine.
+                # If you want a card, add logic here.
+                pass
 
             await send_to_channel(self.guild, embed)
             await send_dm(self.to_manager, f"✅ Your transfer request for **{member.name}** was ACCEPTED!")
@@ -352,7 +356,7 @@ async def help_command(interaction: discord.Interaction):
         "**/sign**: Sign a player\n"
         "**/release**: Release a player\n"
         "**/transfer**: Buy a player from another team\n"
-        "**/set_embed [link]**: Set a custom GIF for signs/releases. Use 'reset' to remove."
+        "**/decorate_transactions [link]**: Set a custom GIF for signs/releases. Use 'reset' to remove."
     ), inline=False)
     
     # Player Section
@@ -364,9 +368,9 @@ async def help_command(interaction: discord.Interaction):
     
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# --- NEW COMMAND: SET EMBED GIF ---
-@client.tree.command(name="set_embed", description="Set a custom GIF or Image for your team's transactions")
-async def set_embed(interaction: discord.Interaction, url: str):
+# --- DECORATE TRANSACTIONS (FORMERLY SET_EMBED) ---
+@client.tree.command(name="decorate_transactions", description="Set a custom GIF or Image for your team's transactions")
+async def decorate_transactions(interaction: discord.Interaction, url: str):
     # 1. Check permissions
     g_config = get_global_config(interaction.guild.id)
     user_roles = [r.id for r in interaction.user.roles]
@@ -378,24 +382,28 @@ async def set_embed(interaction: discord.Interaction, url: str):
     if not team_info:
         return await interaction.response.send_message("❌ You are not managing a registered team.", ephemeral=True)
     
-    # Unpack including new column
+    # Unpack
     team_role, _, _, _ = team_info
 
     # 3. Allow resetting
     if url.lower() in ["none", "reset", "clear", "default"]:
         c.execute("UPDATE teams SET transaction_image = NULL WHERE team_role_id = ?", (team_role.id,))
         conn.commit()
-        return await interaction.response.send_message(f"✅ **{team_role.name}** restored to default contract cards.")
+        return await interaction.response.send_message(f"✅ **{team_role.name}** restored to Default Contract Cards.")
 
     # 4. Basic URL Validation
     if not url.startswith("http"):
         return await interaction.response.send_message("❌ Please provide a valid link (starts with http).", ephemeral=True)
-
+    
     # 5. Save to DB
     c.execute("UPDATE teams SET transaction_image = ? WHERE team_role_id = ?", (url, team_role.id))
     conn.commit()
 
-    await interaction.response.send_message(f"✅ **{team_role.name}** transaction image updated!\nPreview: {url}", ephemeral=True)
+    # 6. Preview
+    embed = discord.Embed(title="Preview", description="Your transactions will look like this:", color=discord.Color.green())
+    embed.set_image(url=url)
+    
+    await interaction.response.send_message(f"✅ **{team_role.name}** transaction image updated!", embed=embed, ephemeral=True)
 
 @client.tree.command(name="looking_for_team", description="Post yourself as a Free Agent")
 @app_commands.choices(region=[app_commands.Choice(name="Asia", value="ASIA"), app_commands.Choice(name="Europe", value="EU"), app_commands.Choice(name="NA", value="NA"), app_commands.Choice(name="SA", value="SA")], 
@@ -462,22 +470,23 @@ async def sign(interaction: discord.Interaction, player: discord.Member):
     await player.add_roles(team_role)
     await cleanup_free_agent(interaction.guild, player)
     
-    # --- VISUAL LOGIC ---
-    file = None
+    # --- VISUAL LOGIC: Custom GIF vs Generated Card ---
     desc = f"The {team_role.mention} have **signed** {player.mention}"
     embed = create_transaction_embed(interaction.guild, f"{team_role.name} Transaction", desc, discord.Color.blue(), team_role, logo, interaction.user, len(team_role.members), limit)
 
-    # Check for custom image first
+    file = None
     if custom_image:
+        # 1. Custom Image Path
         embed.set_image(url=custom_image)
     else:
-        # Fallback to python generated card
+        # 2. Python Card Generation Path (Default)
         try:
             file = await generate_signing_card(player, team_role.name, team_role.color)
             embed.set_image(url="attachment://signing.png")
         except Exception as e:
-            print(f"Image Error: {e}")
+            print(f"Image Generation Error: {e}")
     
+    # Send
     if file:
         await send_to_channel(interaction.guild, embed, file)
     else:
@@ -507,7 +516,8 @@ async def release(interaction: discord.Interaction, player: discord.Member):
     desc = f"The **{team_role.name}** have **released** {player.mention}"
     embed = create_transaction_embed(interaction.guild, f"{team_role.name} Transaction", desc, discord.Color.red(), team_role, logo, interaction.user, len(team_role.members), limit)
     
-    # Apply custom image if exists
+    # --- VISUAL LOGIC FOR RELEASE ---
+    # Releases usually don't generate a "Card", but we use the custom GIF if it exists
     if custom_image:
         embed.set_image(url=custom_image)
     
@@ -622,7 +632,7 @@ async def test_card(interaction: discord.Interaction):
         await interaction.followup.send(f"❌ Error: {e}")
 
 # --- STARTUP ---
-print("System: Loading Logic V10 (Custom GIF/Embeds)...")
+print("System: Loading Logic V11 (Fixes & Renaming)...")
 if TOKEN:
     try:
         keep_alive()
