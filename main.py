@@ -561,4 +561,5 @@ if TOKEN:
         keep_alive()
         client.run(TOKEN)
     except Exception as e:
-        print(f"❌ Error: {e}")Error: {e}")
+
+        print(f"❌ Error: {e}")
