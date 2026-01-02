@@ -169,8 +169,8 @@ async def generate_signing_card(player, team_name, team_color):
     # 3. Text
     try:
         # Tries to find a font, falls back to default if not found
-        font_large = ImageFont.truetype("arial.ttf", 60)
-        font_small = ImageFont.truetype("arial.ttf", 40)
+        font_large = ImageFont.truetype("font.ttf", 60)
+        font_small = ImageFont.truetype("font.ttf", 40)
     except:
         font_large = ImageFont.load_default()
         font_small = ImageFont.load_default()
@@ -639,3 +639,4 @@ if TOKEN:
         client.run(TOKEN)
     except Exception as e:
         print(f"❌ Error: {e}")
+
