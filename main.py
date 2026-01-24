@@ -238,57 +238,7 @@ async def send_dm(user, content=None, embed=None, view=None):
     try: await user.send(content=content, embed=embed, view=view); return True
     except: return False
 
-# --- VIEWS (FIXED INTERACTION FAILED) ---
-
-class SignView(discord.ui.View):
-    def __init__(self, guild, player, team_role, logo, limit, custom_bg):
-        super().__init__(timeout=86400)
-        self.guild = guild
-        self.player = player
-        self.team_role = team_role
-        self.logo = logo
-        self.limit = limit
-        self.custom_bg = custom_bg
-
-    @discord.ui.button(label="Accept Offer", style=discord.ButtonStyle.green, emoji="✍️")
-    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # FIX: Defer immediately to prevent timeout while generating image
-        await interaction.response.defer() 
-
-        # Double check roster limit
-        if len(self.team_role.members) >= self.limit:
-            return await interaction.followup.send("❌ Too late! The team roster is now full.", ephemeral=True)
-
-        member = self.guild.get_member(self.player.id)
-        if not member: 
-            return await interaction.followup.send("❌ You are not in the server.", ephemeral=True)
-
-        await member.add_roles(self.team_role)
-        await cleanup_free_agent(self.guild, member)
-        update_stat(member.id, "transfer") 
-
-        desc = f"The {self.team_role.mention} have **signed** {member.mention}"
-        embed = create_transaction_embed(self.guild, f"{self.team_role.name} Transaction", desc, discord.Color.blue(), self.team_role, self.logo, None, len(self.team_role.members), self.limit)
-
-        try:
-            file = await generate_transaction_card(member, self.team_role.name, self.team_role.color, "OFFICIAL SIGNING", self.custom_bg)
-            embed.set_image(url="attachment://transaction.png")
-            await send_to_channel(self.guild, embed, file)
-        except:
-            await send_to_channel(self.guild, embed)
-
-        # Disable buttons and update message
-        self.stop()
-        for child in self.children: child.disabled = True
-        await interaction.message.edit(content=f"✅ **ACCEPTED:** You joined {self.team_role.name}!", view=self)
-
-    @discord.ui.button(label="Reject", style=discord.ButtonStyle.red, emoji="✖️")
-    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
-        self.stop()
-        for child in self.children: child.disabled = True
-        await interaction.message.edit(content="❌ **Offer Rejected.**", view=self)
-
+# --- VIEWS ---
 
 class TransferView(discord.ui.View):
     def __init__(self, guild, player, from_team, to_team, to_manager, logo):
@@ -305,7 +255,6 @@ class TransferView(discord.ui.View):
         if not is_window_open(self.guild.id):
              return await interaction.response.send_message("❌ **Transfer Window is CLOSED.**", ephemeral=True)
 
-        # FIX: Defer immediately
         await interaction.response.defer()
 
         try:
@@ -435,32 +384,51 @@ async def decorate_transactions(interaction: discord.Interaction, image_file: di
     embed.set_image(url=final_url)
     await interaction.response.send_message(f"✅ **{team_role.name}** custom background set!", embed=embed, ephemeral=True)
 
-@client.tree.command(name="sign", description="Offer a contract to a player (They must accept)")
+@client.tree.command(name="sign", description="Sign a player to YOUR team")
 async def sign(interaction: discord.Interaction, player: discord.Member):
-    if not is_window_open(interaction.guild.id): return await interaction.response.send_message("❌ **Window Closed.**", ephemeral=True)
+    # This version is INSTANT (No DM consent required)
+    await interaction.response.defer() # Defer immediately to allow time for image generation
+    
+    if not is_window_open(interaction.guild.id): 
+        return await interaction.followup.send("❌ **Window Closed.**")
 
     g_config = get_global_config(interaction.guild.id)
     user_roles = [r.id for r in interaction.user.roles]
-    if (g_config[1] not in user_roles) and (g_config[2] not in user_roles): return await interaction.response.send_message("❌ Not Authorized.", ephemeral=True)
+    if (g_config[1] not in user_roles) and (g_config[2] not in user_roles): 
+        return await interaction.followup.send("❌ Not Authorized.")
     
     team_info = find_user_team(interaction.user)
-    if not team_info: return await interaction.response.send_message("❌ No team role.", ephemeral=True)
+    if not team_info: 
+        return await interaction.followup.send("❌ No team role.")
     team_role, logo, limit, custom_bg = team_info 
 
-    if team_role in player.roles: return await interaction.response.send_message("⚠️ Already on team.", ephemeral=True)
-    if find_user_team(player): return await interaction.response.send_message(f"🚫 Player on another team. Use `/transfer`.", ephemeral=True)
-    if len(team_role.members) >= limit: return await interaction.response.send_message("❌ Roster Full!", ephemeral=True)
+    if team_role in player.roles: 
+        return await interaction.followup.send("⚠️ Already on team.")
+    if find_user_team(player): 
+        return await interaction.followup.send(f"🚫 Player on another team. Use `/transfer`.")
+    if len(team_role.members) >= limit: 
+        return await interaction.followup.send("❌ Roster Full!")
     
-    # SEND CONTRACT OFFER
-    view = SignView(interaction.guild, player, team_role, logo, limit, custom_bg)
-    dm_embed = discord.Embed(title=f"Contract Offer: {team_role.name}", color=team_role.color)
-    dm_embed.description = f"You have received a signing offer in **{interaction.guild.name}** from **{team_role.name}**.\n\nDo you accept?"
-    dm_embed.set_footer(text="Expires in 24 hours")
+    # 1. Action: Add Roles & Cleanup
+    await player.add_roles(team_role)
+    await cleanup_free_agent(interaction.guild, player)
+    update_stat(player.id, "transfer") # Track statistic
     
-    if await send_dm(player, embed=dm_embed, view=view):
-        await interaction.response.send_message(f"✅ Contract sent to {player.mention}!", ephemeral=True)
-    else:
-        await interaction.response.send_message(f"❌ Could not DM {player.mention}. They must have DMs open.", ephemeral=True)
+    # 2. Visuals: Embed & Image
+    desc = f"The {team_role.mention} have **signed** {player.mention}"
+    embed = create_transaction_embed(interaction.guild, f"{team_role.name} Transaction", desc, discord.Color.blue(), team_role, logo, interaction.user, len(team_role.members), limit)
+
+    try:
+        file = await generate_transaction_card(player, team_role.name, team_role.color, "OFFICIAL SIGNING", custom_bg)
+        embed.set_image(url="attachment://transaction.png")
+        await send_to_channel(interaction.guild, embed, file)
+    except Exception as e:
+        await interaction.followup.send(f"⚠️ Signed, but image error: {e}")
+        await send_to_channel(interaction.guild, embed)
+
+    # 3. Notification
+    await send_dm(player, content=f"✅ You have been signed to **{team_role.name}**!", embed=embed)
+    await interaction.followup.send("✅ Player Signed!")
 
 @client.tree.command(name="release", description="Release a player")
 async def release(interaction: discord.Interaction, player: discord.Member):
@@ -667,7 +635,7 @@ async def test_card(interaction: discord.Interaction):
         await interaction.followup.send(f"❌ Error: {e}")
 
 # --- STARTUP ---
-print("System: Loading Proxima V15 (Consent & Stats)...")
+print("System: Loading Proxima V15 (Instant Sign + Leaderboards)...")
 if TOKEN:
     try:
         keep_alive()
