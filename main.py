@@ -46,14 +46,14 @@ c.execute("""CREATE TABLE IF NOT EXISTS free_agents (
              timestamp TEXT
              )""")
 
-# 4. Player Stats (New: Tracks Transfers and Demands)
+# 4. Player Stats
 c.execute("""CREATE TABLE IF NOT EXISTS player_stats (
              user_id INTEGER PRIMARY KEY,
              transfers INTEGER DEFAULT 0,
              demands INTEGER DEFAULT 0
              )""")
 
-# --- DATABASE MIGRATIONS (Auto-Fix for old DBs) ---
+# --- DATABASE MIGRATIONS ---
 try: c.execute("ALTER TABLE global_config ADD COLUMN free_agent_role_id INTEGER")
 except sqlite3.OperationalError: pass 
 try: c.execute("ALTER TABLE global_config ADD COLUMN window_open INTEGER DEFAULT 1")
@@ -238,9 +238,8 @@ async def send_dm(user, content=None, embed=None, view=None):
     try: await user.send(content=content, embed=embed, view=view); return True
     except: return False
 
-# --- VIEWS ---
+# --- VIEWS (FIXED INTERACTION FAILED) ---
 
-# 1. Sign View (New: Player Consent)
 class SignView(discord.ui.View):
     def __init__(self, guild, player, team_role, logo, limit, custom_bg):
         super().__init__(timeout=86400)
@@ -253,16 +252,20 @@ class SignView(discord.ui.View):
 
     @discord.ui.button(label="Accept Offer", style=discord.ButtonStyle.green, emoji="✍️")
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Double check roster limit in case it filled up while waiting
+        # FIX: Defer immediately to prevent timeout while generating image
+        await interaction.response.defer() 
+
+        # Double check roster limit
         if len(self.team_role.members) >= self.limit:
-            return await interaction.response.send_message("❌ Too late! The team roster is now full.", ephemeral=True)
+            return await interaction.followup.send("❌ Too late! The team roster is now full.", ephemeral=True)
 
         member = self.guild.get_member(self.player.id)
-        if not member: return await interaction.response.send_message("❌ You are not in the server.", ephemeral=True)
+        if not member: 
+            return await interaction.followup.send("❌ You are not in the server.", ephemeral=True)
 
         await member.add_roles(self.team_role)
         await cleanup_free_agent(self.guild, member)
-        update_stat(member.id, "transfer") # Count as transfer
+        update_stat(member.id, "transfer") 
 
         desc = f"The {self.team_role.mention} have **signed** {member.mention}"
         embed = create_transaction_embed(self.guild, f"{self.team_role.name} Transaction", desc, discord.Color.blue(), self.team_role, self.logo, None, len(self.team_role.members), self.limit)
@@ -274,19 +277,19 @@ class SignView(discord.ui.View):
         except:
             await send_to_channel(self.guild, embed)
 
-        await interaction.response.send_message(f"✅ You have joined **{self.team_role.name}**!")
+        # Disable buttons and update message
         self.stop()
         for child in self.children: child.disabled = True
-        await interaction.message.edit(view=self)
+        await interaction.message.edit(content=f"✅ **ACCEPTED:** You joined {self.team_role.name}!", view=self)
 
     @discord.ui.button(label="Reject", style=discord.ButtonStyle.red, emoji="✖️")
     async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("❌ Offer Rejected.")
+        await interaction.response.defer()
         self.stop()
         for child in self.children: child.disabled = True
-        await interaction.message.edit(view=self)
+        await interaction.message.edit(content="❌ **Offer Rejected.**", view=self)
 
-# 2. Transfer View
+
 class TransferView(discord.ui.View):
     def __init__(self, guild, player, from_team, to_team, to_manager, logo):
         super().__init__(timeout=86400)
@@ -302,14 +305,18 @@ class TransferView(discord.ui.View):
         if not is_window_open(self.guild.id):
              return await interaction.response.send_message("❌ **Transfer Window is CLOSED.**", ephemeral=True)
 
+        # FIX: Defer immediately
+        await interaction.response.defer()
+
         try:
             member = self.guild.get_member(self.player.id)
-            if not member: return await interaction.response.send_message("❌ Player missing.", ephemeral=True)
+            if not member: 
+                return await interaction.followup.send("❌ Player missing.", ephemeral=True)
             
             await member.remove_roles(self.from_team)
             await member.add_roles(self.to_team)
             await cleanup_free_agent(self.guild, member)
-            update_stat(member.id, "transfer") # Count as transfer
+            update_stat(member.id, "transfer")
 
             desc = f"🚨 **TRANSFER NEWS** 🚨\n\n{member.mention} has been transferred\nFrom: {self.from_team.mention}\nTo: {self.to_team.mention}"
             
@@ -319,7 +326,6 @@ class TransferView(discord.ui.View):
 
             embed = create_transaction_embed(self.guild, "Official Transfer", desc, discord.Color.purple(), self.to_team, self.logo, self.to_manager, len(self.to_team.members), limit)
             
-            # Transfer Card
             file = await generate_transaction_card(member, self.to_team.name, self.to_team.color, "OFFICIAL TRANSFER", custom_bg)
             embed.set_image(url="attachment://transaction.png")
 
@@ -327,20 +333,19 @@ class TransferView(discord.ui.View):
             await send_dm(self.to_manager, f"✅ Transfer for **{member.name}** ACCEPTED!")
             
             self.stop()
-            await interaction.response.send_message("✅ Processed.")
             for child in self.children: child.disabled = True
-            await interaction.message.edit(view=self)
+            await interaction.message.edit(content="✅ **Transfer Approved.**", view=self)
 
         except Exception as e:
-            await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
+            await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
 
     @discord.ui.button(label="Decline", style=discord.ButtonStyle.red, emoji="❌")
     async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
         await send_dm(self.to_manager, f"❌ Transfer for **{self.player.name}** DECLINED.")
         self.stop()
-        await interaction.response.send_message("❌ Declined.")
         for child in self.children: child.disabled = True
-        await interaction.message.edit(view=self)
+        await interaction.message.edit(content="❌ **Transfer Declined.**", view=self)
 
 # --- BOT CLASS ---
 class LeagueBot(discord.Client):
