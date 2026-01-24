@@ -12,7 +12,7 @@ import aiohttp
 
 # --- CONFIGURATION ---
 TOKEN = os.environ.get('TOKEN')
-DEFAULT_BG_FILE = "proxima_default.jpg" # Rename your uploaded banner to this!
+DEFAULT_BG_FILE = "proxima_default.jpg" 
 
 # --- DATABASE SETUP ---
 conn = sqlite3.connect('team_manager.db')
@@ -25,7 +25,8 @@ c.execute("""CREATE TABLE IF NOT EXISTS global_config (
              asst_role_id INTEGER,
              contract_channel_id INTEGER,
              free_agent_role_id INTEGER,
-             window_open INTEGER DEFAULT 1
+             window_open INTEGER DEFAULT 1,
+             demand_limit INTEGER DEFAULT 3
              )""")
 
 # 2. Teams Table
@@ -36,14 +37,6 @@ c.execute("""CREATE TABLE IF NOT EXISTS teams (
              transaction_image TEXT
              )""")
 
-# Migrations (Auto-fix for older DB versions)
-try: c.execute("ALTER TABLE global_config ADD COLUMN free_agent_role_id INTEGER")
-except sqlite3.OperationalError: pass 
-try: c.execute("ALTER TABLE global_config ADD COLUMN window_open INTEGER DEFAULT 1")
-except sqlite3.OperationalError: pass
-try: c.execute("ALTER TABLE teams ADD COLUMN transaction_image TEXT")
-except sqlite3.OperationalError: pass
-
 # 3. Free Agents
 c.execute("""CREATE TABLE IF NOT EXISTS free_agents (
              user_id INTEGER PRIMARY KEY,
@@ -52,6 +45,23 @@ c.execute("""CREATE TABLE IF NOT EXISTS free_agents (
              description TEXT,
              timestamp TEXT
              )""")
+
+# 4. Player Stats (New: Tracks Transfers and Demands)
+c.execute("""CREATE TABLE IF NOT EXISTS player_stats (
+             user_id INTEGER PRIMARY KEY,
+             transfers INTEGER DEFAULT 0,
+             demands INTEGER DEFAULT 0
+             )""")
+
+# --- DATABASE MIGRATIONS (Auto-Fix for old DBs) ---
+try: c.execute("ALTER TABLE global_config ADD COLUMN free_agent_role_id INTEGER")
+except sqlite3.OperationalError: pass 
+try: c.execute("ALTER TABLE global_config ADD COLUMN window_open INTEGER DEFAULT 1")
+except sqlite3.OperationalError: pass
+try: c.execute("ALTER TABLE teams ADD COLUMN transaction_image TEXT")
+except sqlite3.OperationalError: pass
+try: c.execute("ALTER TABLE global_config ADD COLUMN demand_limit INTEGER DEFAULT 3")
+except sqlite3.OperationalError: pass
 conn.commit()
 
 # --- HELPER FUNCTIONS ---
@@ -67,6 +77,23 @@ def get_team_data(role_id):
 def get_all_teams():
     c.execute("SELECT * FROM teams")
     return c.fetchall()
+
+def get_player_stats(user_id):
+    c.execute("SELECT * FROM player_stats WHERE user_id = ?", (user_id,))
+    data = c.fetchone()
+    if not data:
+        c.execute("INSERT INTO player_stats (user_id, transfers, demands) VALUES (?, 0, 0)", (user_id,))
+        conn.commit()
+        return (user_id, 0, 0)
+    return data
+
+def update_stat(user_id, stat_type, amount=1):
+    get_player_stats(user_id) # Ensure exists
+    if stat_type == "transfer":
+        c.execute("UPDATE player_stats SET transfers = transfers + ? WHERE user_id = ?", (amount, user_id))
+    elif stat_type == "demand":
+        c.execute("UPDATE player_stats SET demands = demands + ? WHERE user_id = ?", (amount, user_id))
+    conn.commit()
 
 def find_user_team(member):
     for role in member.roles:
@@ -118,15 +145,10 @@ def format_roster_list(members, mgr_id, asst_id):
 
 # --- MASTER CARD GENERATOR ---
 async def generate_transaction_card(player, team_name, team_color, title_text="OFFICIAL SIGNING", custom_bg_url=None):
-    """
-    Generates a transaction card.
-    Priority: Custom Team URL > Local Default File (Proxima Logo) > Solid Color
-    """
-    
     W, H = 800, 400
     img = None
     
-    # 1. Background Priority: Custom URL (from /decorate_transactions)
+    # 1. Custom URL
     if custom_bg_url:
         try:
             async with aiohttp.ClientSession() as session:
@@ -135,31 +157,24 @@ async def generate_transaction_card(player, team_name, team_color, title_text="O
                         data = await resp.read()
                         bg_img = Image.open(io.BytesIO(data)).convert("RGB")
                         img = bg_img.resize((W, H))
-                        
-                        # Add Dark Overlay for readability
                         overlay = Image.new("RGBA", (W, H), (0,0,0,0))
                         draw_overlay = ImageDraw.Draw(overlay)
                         draw_overlay.rectangle([(0, 240), (W, H)], fill=(0, 0, 0, 160))
                         img.paste(overlay, (0,0), mask=overlay)
-        except Exception as e:
-            print(f"Failed to load custom bg: {e}")
-            img = None
+        except: img = None
 
-    # 2. Background Priority: Local Default File (Your Uploaded Image)
-    if img is None:
-        if os.path.exists(DEFAULT_BG_FILE):
-            try:
-                bg_img = Image.open(DEFAULT_BG_FILE).convert("RGB")
-                img = bg_img.resize((W, H))
-                # Add slight overlay to ensure text pops
-                overlay = Image.new("RGBA", (W, H), (0,0,0,0))
-                draw_overlay = ImageDraw.Draw(overlay)
-                draw_overlay.rectangle([(0, 240), (W, H)], fill=(0, 0, 0, 140))
-                img.paste(overlay, (0,0), mask=overlay)
-            except Exception as e:
-                print(f"Failed to load local default: {e}")
+    # 2. Local Default
+    if img is None and os.path.exists(DEFAULT_BG_FILE):
+        try:
+            bg_img = Image.open(DEFAULT_BG_FILE).convert("RGB")
+            img = bg_img.resize((W, H))
+            overlay = Image.new("RGBA", (W, H), (0,0,0,0))
+            draw_overlay = ImageDraw.Draw(overlay)
+            draw_overlay.rectangle([(0, 240), (W, H)], fill=(0, 0, 0, 140))
+            img.paste(overlay, (0,0), mask=overlay)
+        except: pass
 
-    # 3. Background Priority: Solid Color (Fallback)
+    # 3. Fallback Color
     if img is None:
         bg_color = team_color.to_rgb()
         if bg_color == (0, 0, 0): bg_color = (44, 47, 51)
@@ -167,7 +182,7 @@ async def generate_transaction_card(player, team_name, team_color, title_text="O
 
     draw = ImageDraw.Draw(img)
 
-    # 4. Avatar Handling
+    # 4. Avatar
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(player.display_avatar.url) as resp:
@@ -175,23 +190,18 @@ async def generate_transaction_card(player, team_name, team_color, title_text="O
                     data = await resp.read()
                     avatar = Image.open(io.BytesIO(data)).convert("RGBA")
                     avatar = avatar.resize((200, 200))
-                    
-                    # Circular Mask
                     mask = Image.new("L", (200, 200), 0)
                     draw_mask = ImageDraw.Draw(mask)
                     draw_mask.ellipse((0, 0, 200, 200), fill=255)
-                    
                     img.paste(avatar, (300, 50), mask=mask)
                     draw.ellipse((300, 50, 500, 250), outline="white", width=3)
-    except:
-        pass 
+    except: pass 
 
-    # 5. Text Handling (Using font.ttf)
+    # 5. Text
     try:
         font_large = ImageFont.truetype("font.ttf", 60)
         font_small = ImageFont.truetype("font.ttf", 40)
-    except OSError:
-        print("⚠️ 'font.ttf' not found. Using default.")
+    except:
         font_large = ImageFont.load_default()
         font_small = ImageFont.load_default()
 
@@ -201,7 +211,6 @@ async def generate_transaction_card(player, team_name, team_color, title_text="O
     buffer = io.BytesIO()
     img.save(buffer, format="PNG")
     buffer.seek(0)
-    
     return discord.File(buffer, filename="transaction.png")
 
 # --- EMBED GENERATOR ---
@@ -209,16 +218,10 @@ def create_transaction_embed(guild, title, description, color, team_role, logo, 
     embed = discord.Embed(description=description, color=color, timestamp=datetime.datetime.now())
     embed.set_author(name=guild.name, icon_url=guild.icon.url if guild.icon else None)
     embed.title = title
-    
-    if logo and "http" in logo:
-        embed.set_thumbnail(url=logo)
-
-    if coach:
-        embed.add_field(name="Coach:", value=f"👔 {coach.mention}", inline=False)
-    
+    if logo and "http" in logo: embed.set_thumbnail(url=logo)
+    if coach: embed.add_field(name="Coach:", value=f"👔 {coach.mention}", inline=False)
     roster_text = f"{roster_count}/{limit}" if limit > 0 else f"{roster_count} (No Limit)"
     embed.add_field(name="Roster:", value=f"👥 {roster_text}", inline=False)
-    
     embed.set_footer(text="Official Transaction")
     return embed
 
@@ -235,7 +238,55 @@ async def send_dm(user, content=None, embed=None, view=None):
     try: await user.send(content=content, embed=embed, view=view); return True
     except: return False
 
-# --- TRANSFER VIEW ---
+# --- VIEWS ---
+
+# 1. Sign View (New: Player Consent)
+class SignView(discord.ui.View):
+    def __init__(self, guild, player, team_role, logo, limit, custom_bg):
+        super().__init__(timeout=86400)
+        self.guild = guild
+        self.player = player
+        self.team_role = team_role
+        self.logo = logo
+        self.limit = limit
+        self.custom_bg = custom_bg
+
+    @discord.ui.button(label="Accept Offer", style=discord.ButtonStyle.green, emoji="✍️")
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Double check roster limit in case it filled up while waiting
+        if len(self.team_role.members) >= self.limit:
+            return await interaction.response.send_message("❌ Too late! The team roster is now full.", ephemeral=True)
+
+        member = self.guild.get_member(self.player.id)
+        if not member: return await interaction.response.send_message("❌ You are not in the server.", ephemeral=True)
+
+        await member.add_roles(self.team_role)
+        await cleanup_free_agent(self.guild, member)
+        update_stat(member.id, "transfer") # Count as transfer
+
+        desc = f"The {self.team_role.mention} have **signed** {member.mention}"
+        embed = create_transaction_embed(self.guild, f"{self.team_role.name} Transaction", desc, discord.Color.blue(), self.team_role, self.logo, None, len(self.team_role.members), self.limit)
+
+        try:
+            file = await generate_transaction_card(member, self.team_role.name, self.team_role.color, "OFFICIAL SIGNING", self.custom_bg)
+            embed.set_image(url="attachment://transaction.png")
+            await send_to_channel(self.guild, embed, file)
+        except:
+            await send_to_channel(self.guild, embed)
+
+        await interaction.response.send_message(f"✅ You have joined **{self.team_role.name}**!")
+        self.stop()
+        for child in self.children: child.disabled = True
+        await interaction.message.edit(view=self)
+
+    @discord.ui.button(label="Reject", style=discord.ButtonStyle.red, emoji="✖️")
+    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("❌ Offer Rejected.")
+        self.stop()
+        for child in self.children: child.disabled = True
+        await interaction.message.edit(view=self)
+
+# 2. Transfer View
 class TransferView(discord.ui.View):
     def __init__(self, guild, player, from_team, to_team, to_manager, logo):
         super().__init__(timeout=86400)
@@ -258,6 +309,7 @@ class TransferView(discord.ui.View):
             await member.remove_roles(self.from_team)
             await member.add_roles(self.to_team)
             await cleanup_free_agent(self.guild, member)
+            update_stat(member.id, "transfer") # Count as transfer
 
             desc = f"🚨 **TRANSFER NEWS** 🚨\n\n{member.mention} has been transferred\nFrom: {self.from_team.mention}\nTo: {self.to_team.mention}"
             
@@ -303,16 +355,18 @@ client = LeagueBot()
 
 # --- COMMANDS ---
 
-@client.tree.command(name="setup_global", description="Set roles and channels.")
-async def setup_global(interaction: discord.Interaction, manager_role: discord.Role, asst_role: discord.Role, free_agent_role: discord.Role, channel: discord.TextChannel):
+@client.tree.command(name="setup_global", description="Set roles, channels, and limits.")
+async def setup_global(interaction: discord.Interaction, manager_role: discord.Role, asst_role: discord.Role, free_agent_role: discord.Role, channel: discord.TextChannel, demand_limit: int = 3):
     if not is_staff(interaction): return await interaction.response.send_message("❌ Admin Only", ephemeral=True)
     current_config = get_global_config(interaction.guild.id)
     window_state = 1
     if current_config and len(current_config) > 5: window_state = current_config[5]
-    c.execute("INSERT OR REPLACE INTO global_config VALUES (?, ?, ?, ?, ?, ?)", 
-              (interaction.guild.id, manager_role.id, asst_role.id, channel.id, free_agent_role.id, window_state))
+    
+    # Insert with demand_limit
+    c.execute("INSERT OR REPLACE INTO global_config VALUES (?, ?, ?, ?, ?, ?, ?)", 
+              (interaction.guild.id, manager_role.id, asst_role.id, channel.id, free_agent_role.id, window_state, demand_limit))
     conn.commit()
-    await interaction.response.send_message(f"✅ **Config Saved!**", ephemeral=True)
+    await interaction.response.send_message(f"✅ **Config Saved!** (Demand Limit: {demand_limit})", ephemeral=True)
 
 @client.tree.command(name="setup_team", description="Register a Team Role")
 async def setup_team(interaction: discord.Interaction, team_role: discord.Role, logo: str, roster_limit: int = 20):
@@ -345,79 +399,63 @@ async def window(interaction: discord.Interaction, status: int):
 
 @client.tree.command(name="decorate_transactions", description="Set custom contract background (Upload Image OR Link)")
 async def decorate_transactions(interaction: discord.Interaction, image_file: discord.Attachment = None, url: str = None):
-    # 1. Permissions
+    # Permissions
     g_config = get_global_config(interaction.guild.id)
     user_roles = [r.id for r in interaction.user.roles]
     if (g_config[1] not in user_roles) and (g_config[2] not in user_roles) and not interaction.user.guild_permissions.administrator:
         return await interaction.response.send_message("❌ Managers or Admins only.", ephemeral=True)
 
-    # 2. Find Team
     team_info = find_user_team(interaction.user)
     if not team_info: return await interaction.response.send_message("❌ You aren't managing a team.", ephemeral=True)
     team_role, _, _, _ = team_info
 
-    # 3. Determine Input
     final_url = None
-    
     if url and url.lower() in ["reset", "none", "remove"]:
         c.execute("UPDATE teams SET transaction_image = NULL WHERE team_role_id = ?", (team_role.id,))
         conn.commit()
         return await interaction.response.send_message(f"✅ **{team_role.name}** reverted to Proxima Default.")
 
     if image_file:
-        if not image_file.content_type.startswith("image/"):
-             return await interaction.response.send_message("❌ File must be an image.", ephemeral=True)
+        if not image_file.content_type.startswith("image/"): return await interaction.response.send_message("❌ File must be an image.", ephemeral=True)
         final_url = image_file.url
     elif url:
-        if not url.startswith("http"):
-            return await interaction.response.send_message("❌ Invalid Link.", ephemeral=True)
+        if not url.startswith("http"): return await interaction.response.send_message("❌ Invalid Link.", ephemeral=True)
         final_url = url
     else:
         return await interaction.response.send_message("❌ Provide an **Image File** OR a **URL**.", ephemeral=True)
 
-    # 4. Save to DB
     c.execute("UPDATE teams SET transaction_image = ? WHERE team_role_id = ?", (final_url, team_role.id))
     conn.commit()
-
-    # 5. Preview
     embed = discord.Embed(title="Background Updated", description="Your future signings will look like this:", color=discord.Color.green())
     embed.set_image(url=final_url)
     await interaction.response.send_message(f"✅ **{team_role.name}** custom background set!", embed=embed, ephemeral=True)
 
-@client.tree.command(name="sign", description="Sign a player to YOUR team")
+@client.tree.command(name="sign", description="Offer a contract to a player (They must accept)")
 async def sign(interaction: discord.Interaction, player: discord.Member):
-    await interaction.response.defer()
-    if not is_window_open(interaction.guild.id): return await interaction.followup.send("❌ **Window Closed.**")
+    if not is_window_open(interaction.guild.id): return await interaction.response.send_message("❌ **Window Closed.**", ephemeral=True)
 
     g_config = get_global_config(interaction.guild.id)
     user_roles = [r.id for r in interaction.user.roles]
-    if (g_config[1] not in user_roles) and (g_config[2] not in user_roles): return await interaction.followup.send("❌ Not Authorized.")
+    if (g_config[1] not in user_roles) and (g_config[2] not in user_roles): return await interaction.response.send_message("❌ Not Authorized.", ephemeral=True)
     
     team_info = find_user_team(interaction.user)
-    if not team_info: return await interaction.followup.send("❌ No team role.")
+    if not team_info: return await interaction.response.send_message("❌ No team role.", ephemeral=True)
     team_role, logo, limit, custom_bg = team_info 
 
-    if team_role in player.roles: return await interaction.followup.send("⚠️ Already on team.")
-    if find_user_team(player): return await interaction.followup.send(f"🚫 Player on another team. Use `/transfer`.")
-    if len(team_role.members) >= limit: return await interaction.followup.send("❌ Roster Full!")
+    if team_role in player.roles: return await interaction.response.send_message("⚠️ Already on team.", ephemeral=True)
+    if find_user_team(player): return await interaction.response.send_message(f"🚫 Player on another team. Use `/transfer`.", ephemeral=True)
+    if len(team_role.members) >= limit: return await interaction.response.send_message("❌ Roster Full!", ephemeral=True)
     
-    await player.add_roles(team_role)
-    await cleanup_free_agent(interaction.guild, player)
+    # SEND CONTRACT OFFER
+    view = SignView(interaction.guild, player, team_role, logo, limit, custom_bg)
+    dm_embed = discord.Embed(title=f"Contract Offer: {team_role.name}", color=team_role.color)
+    dm_embed.description = f"You have received a signing offer in **{interaction.guild.name}** from **{team_role.name}**.\n\nDo you accept?"
+    dm_embed.set_footer(text="Expires in 24 hours")
     
-    desc = f"The {team_role.mention} have **signed** {player.mention}"
-    embed = create_transaction_embed(interaction.guild, f"{team_role.name} Transaction", desc, discord.Color.blue(), team_role, logo, interaction.user, len(team_role.members), limit)
-
-    # SIGNING CARD
-    try:
-        file = await generate_transaction_card(player, team_role.name, team_role.color, "OFFICIAL SIGNING", custom_bg)
-        embed.set_image(url="attachment://transaction.png")
-        await send_to_channel(interaction.guild, embed, file)
-    except Exception as e:
-        await interaction.followup.send(f"Error generating card: {e}")
-        await send_to_channel(interaction.guild, embed)
-
-    await send_dm(player, content=f"✅ Signed to **{team_role.name}**!", embed=embed)
-    await interaction.followup.send("✅ Player Signed!")
+    if await send_dm(player, embed=dm_embed, view=view):
+        await interaction.response.send_message(f"✅ Contract sent to {player.mention}!", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"❌ Could not DM {player.mention}. They must have DMs open.", ephemeral=True)
 
 @client.tree.command(name="release", description="Release a player")
 async def release(interaction: discord.Interaction, player: discord.Member):
@@ -433,7 +471,6 @@ async def release(interaction: discord.Interaction, player: discord.Member):
     desc = f"The **{team_role.name}** have **released** {player.mention}"
     embed = create_transaction_embed(interaction.guild, f"{team_role.name} Transaction", desc, discord.Color.red(), team_role, logo, interaction.user, len(team_role.members), limit)
     
-    # RELEASE CARD
     try:
         file = await generate_transaction_card(player, team_role.name, team_role.color, "OFFICIAL RELEASE", custom_bg)
         embed.set_image(url="attachment://transaction.png")
@@ -444,25 +481,77 @@ async def release(interaction: discord.Interaction, player: discord.Member):
     await send_dm(player, content=f"⚠️ Released from **{team_role.name}**.", embed=embed)
     await interaction.response.send_message("✅ Released!", ephemeral=True)
 
-@client.tree.command(name="demand", description="Leave your current team")
+@client.tree.command(name="demand", description="Leave your current team (Uses Demand Limit)")
 async def demand(interaction: discord.Interaction):
     team_info = find_user_team(interaction.user)
     if not team_info: return await interaction.response.send_message("❌ Not in a team.", ephemeral=True)
     team_role, logo, limit, _ = team_info
     
+    # CHECK DEMAND LIMIT
+    g_conf = get_global_config(interaction.guild.id)
+    demand_limit = g_conf[6] if g_conf and len(g_conf) > 6 else 3
+    stats = get_player_stats(interaction.user.id)
+    demands_used = stats[2]
+
+    if demands_used >= demand_limit:
+        return await interaction.response.send_message(f"🚫 **Demand Limit Reached!** ({demands_used}/{demand_limit})\nYou cannot leave your team.", ephemeral=True)
+
+    # PROCESS DEMAND
     await interaction.user.remove_roles(team_role)
+    update_stat(interaction.user.id, "demand")
+    demands_left = demand_limit - (demands_used + 1)
+
     config = get_global_config(interaction.guild.id)
     if config and config[4]: 
         fa_role = interaction.guild.get_role(config[4])
         if fa_role: await interaction.user.add_roles(fa_role)
 
-    desc = f"{interaction.user.mention} has **Demanded Release** from the team."
+    desc = f"{interaction.user.mention} has **Demanded Release** from the team.\n\n⚠️ **Demands Left:** {demands_left}"
     embed = create_transaction_embed(interaction.guild, "Transfer Demand", desc, discord.Color.dark_grey(), team_role, logo, None, len(team_role.members), limit)
     await send_to_channel(interaction.guild, embed)
     
     heads, assts = get_managers_of_team(interaction.guild, team_role)
     for mgr in heads + assts: await send_dm(mgr, content=f"📢 {interaction.user.name} has left your team.")
-    await interaction.response.send_message(f"👋 Left **{team_role.name}**.", ephemeral=True)
+    await interaction.response.send_message(f"👋 Left **{team_role.name}**.\nDemands remaining: {demands_left}", ephemeral=True)
+
+@client.tree.command(name="promote", description="Promote a player to Assistant Manager")
+async def promote(interaction: discord.Interaction, player: discord.Member):
+    g_config = get_global_config(interaction.guild.id)
+    user_roles = [r.id for r in interaction.user.roles]
+    if g_config[1] not in user_roles and not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("❌ Head Managers only.", ephemeral=True)
+
+    team_info = find_user_team(interaction.user)
+    if not team_info: return await interaction.response.send_message("❌ You aren't managing a team.", ephemeral=True)
+    team_role = team_info[0]
+
+    if team_role not in player.roles: return await interaction.response.send_message("❌ Player is not on your team.", ephemeral=True)
+    
+    asst_role_id = g_config[2]
+    asst_role = interaction.guild.get_role(asst_role_id)
+    if not asst_role: return await interaction.response.send_message("❌ Assistant Role not configured.", ephemeral=True)
+
+    await player.add_roles(asst_role)
+    await interaction.response.send_message(f"✅ Promoted {player.mention} to **Assistant Manager** of {team_role.name}!")
+
+@client.tree.command(name="transfer_list", description="Show top players by transfer count")
+async def transfer_list(interaction: discord.Interaction):
+    if not is_staff(interaction): return await interaction.response.send_message("❌ Admin Only", ephemeral=True)
+    
+    c.execute("SELECT user_id, transfers FROM player_stats ORDER BY transfers DESC LIMIT 15")
+    data = c.fetchall()
+    
+    if not data: return await interaction.response.send_message("No transfer history found.", ephemeral=True)
+
+    embed = discord.Embed(title="📊 Most Transfers", color=discord.Color.gold())
+    desc = ""
+    for idx, (uid, count) in enumerate(data, 1):
+        user = interaction.guild.get_member(uid)
+        name = user.name if user else f"Unknown ({uid})"
+        desc += f"**{idx}.** {name} — {count} Transfers\n"
+    
+    embed.description = desc
+    await interaction.response.send_message(embed=embed)
 
 @client.tree.command(name="looking_for_team", description="Post yourself as a Free Agent")
 @app_commands.choices(region=[app_commands.Choice(name="Asia", value="ASIA"), app_commands.Choice(name="Europe", value="EU"), app_commands.Choice(name="NA", value="NA"), app_commands.Choice(name="SA", value="SA")], 
@@ -573,7 +662,7 @@ async def test_card(interaction: discord.Interaction):
         await interaction.followup.send(f"❌ Error: {e}")
 
 # --- STARTUP ---
-print("System: Loading Proxima V14 (Font Fix & Logo Support)...")
+print("System: Loading Proxima V15 (Consent & Stats)...")
 if TOKEN:
     try:
         keep_alive()
