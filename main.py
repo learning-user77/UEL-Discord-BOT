@@ -238,7 +238,7 @@ async def send_dm(user, content=None, embed=None, view=None):
     try: await user.send(content=content, embed=embed, view=view); return True
     except: return False
 
-# --- VIEWS ---
+# --- VIEWS (PAGINATION & CONFIRMATION) ---
 
 class TransferView(discord.ui.View):
     def __init__(self, guild, player, from_team, to_team, to_manager, logo):
@@ -296,6 +296,45 @@ class TransferView(discord.ui.View):
         for child in self.children: child.disabled = True
         await interaction.message.edit(content="❌ **Transfer Declined.**", view=self)
 
+class HelpView(discord.ui.View):
+    def __init__(self, embeds):
+        super().__init__(timeout=60)
+        self.embeds = embeds
+        self.current_page = 0
+        self.update_buttons()
+
+    def update_buttons(self):
+        self.previous.disabled = self.current_page == 0
+        self.next.disabled = self.current_page == len(self.embeds) - 1
+
+    @discord.ui.button(label="Previous", style=discord.ButtonStyle.primary)
+    async def previous(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_page -= 1
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.embeds[self.current_page], view=self)
+
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.primary)
+    async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_page += 1
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.embeds[self.current_page], view=self)
+
+class ResetView(discord.ui.View):
+    def __init__(self, guild_id):
+        super().__init__(timeout=30)
+        self.guild_id = guild_id
+
+    @discord.ui.button(label="⚠️ CONFIRM WIPE", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Delete Config
+        c.execute("DELETE FROM global_config WHERE guild_id = ?", (self.guild_id,))
+        conn.commit()
+        await interaction.response.edit_message(content="✅ **Configuration Wiped.** Please run `/setup_global` again.", view=None, embed=None)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="❌ **Reset Cancelled.**", view=None, embed=None)
+
 # --- BOT CLASS ---
 class LeagueBot(discord.Client):
     def __init__(self):
@@ -308,6 +347,74 @@ class LeagueBot(discord.Client):
 client = LeagueBot()
 
 # --- COMMANDS ---
+
+@client.tree.command(name="help", description="Show bot commands")
+async def help_command(interaction: discord.Interaction):
+    # Page 1: General/Player
+    embed1 = discord.Embed(title="Help - General Commands (Page 1/3)", color=discord.Color.blue())
+    embed1.add_field(name="/looking_for_team", value="Post yourself as a Free Agent", inline=False)
+    embed1.add_field(name="/demand", value="Leave your current team (Uses Demand Limit)", inline=False)
+    embed1.add_field(name="/team_view [role]", value="View a team's roster", inline=False)
+    embed1.add_field(name="/free_agents", value="View available players", inline=False)
+    
+    # Page 2: Manager
+    embed2 = discord.Embed(title="Help - Manager Commands (Page 2/3)", color=discord.Color.green())
+    embed2.add_field(name="/sign [player]", value="Sign a player to your team", inline=False)
+    embed2.add_field(name="/release [player]", value="Release a player", inline=False)
+    embed2.add_field(name="/transfer [player]", value="Request to buy a player", inline=False)
+    embed2.add_field(name="/promote [player]", value="Promote player to Assistant Manager", inline=False)
+    embed2.add_field(name="/tm_transfer [player]", value="Transfer Team Ownership to a player", inline=False)
+    embed2.add_field(name="/decorate_transactions", value="Set custom transaction card background", inline=False)
+
+    # Page 3: Admin
+    embed3 = discord.Embed(title="Help - Admin Commands (Page 3/3)", color=discord.Color.red())
+    embed3.add_field(name="/setup_global", value="Configure bot roles/channels", inline=False)
+    embed3.add_field(name="/setup_team", value="Register a new team", inline=False)
+    embed3.add_field(name="/team_delete", value="Delete a team", inline=False)
+    embed3.add_field(name="/window", value="Open/Close transfer window", inline=False)
+    embed3.add_field(name="/reset_config", value="Wipe server configuration", inline=False)
+    embed3.add_field(name="/transfer_list", value="View top transfers leaderboard", inline=False)
+
+    view = HelpView([embed1, embed2, embed3])
+    await interaction.response.send_message(embed=embed1, view=view, ephemeral=True)
+
+@client.tree.command(name="tm_transfer", description="Transfer Team Ownership to another player")
+async def tm_transfer(interaction: discord.Interaction, player: discord.Member):
+    g_config = get_global_config(interaction.guild.id)
+    if not g_config: return await interaction.response.send_message("❌ Config not set.", ephemeral=True)
+    
+    mgr_role_id = g_config[1]
+    mgr_role = interaction.guild.get_role(mgr_role_id)
+    
+    if not mgr_role: return await interaction.response.send_message("❌ Manager role missing from config.", ephemeral=True)
+
+    # Check if user is manager
+    if mgr_role not in interaction.user.roles:
+        return await interaction.response.send_message("❌ You are not a Team Manager.", ephemeral=True)
+    
+    # Check if user manages the team the player is on
+    team_info = find_user_team(interaction.user)
+    if not team_info: return await interaction.response.send_message("❌ You don't have a team.", ephemeral=True)
+    team_role = team_info[0]
+    
+    if team_role not in player.roles:
+        return await interaction.response.send_message("❌ That player is not on your team.", ephemeral=True)
+    
+    # Execute Transfer
+    try:
+        await interaction.user.remove_roles(mgr_role)
+        await player.add_roles(mgr_role)
+        await interaction.response.send_message(f"✅ **Ownership Transferred!**\n{interaction.user.mention} ➝ {player.mention}\n{player.mention} is now the Manager of **{team_role.name}**.")
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Role Error: {e}", ephemeral=True)
+
+@client.tree.command(name="reset_config", description="⚠️ WIPE SERVER DATA (Admin Only)")
+async def reset_config(interaction: discord.Interaction):
+    if not is_staff(interaction): return await interaction.response.send_message("❌ Admin Only", ephemeral=True)
+    
+    view = ResetView(interaction.guild.id)
+    embed = discord.Embed(title="⚠️ DANGER ZONE", description="Are you sure you want to **RESET** the bot configuration for this server?\n\nThis will delete:\n- Global Config (Roles/Channels)\n- Demand Limits\n\n(It will NOT delete Teams or Player Stats)", color=discord.Color.dark_red())
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 @client.tree.command(name="setup_global", description="Set roles, channels, and limits.")
 async def setup_global(interaction: discord.Interaction, manager_role: discord.Role, asst_role: discord.Role, free_agent_role: discord.Role, channel: discord.TextChannel, demand_limit: int = 3):
@@ -635,7 +742,7 @@ async def test_card(interaction: discord.Interaction):
         await interaction.followup.send(f"❌ Error: {e}")
 
 # --- STARTUP ---
-print("System: Loading Proxima V15 (Instant Sign + Leaderboards)...")
+print("System: Loading Proxima V16 (Help, Transfer Owner, Config Reset)...")
 if TOKEN:
     try:
         keep_alive()
