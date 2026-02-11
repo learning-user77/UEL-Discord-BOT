@@ -742,9 +742,31 @@ async def test_card(interaction: discord.Interaction):
         await interaction.followup.send(f"❌ Error: {e}")
 
 # --- STARTUP ---
+# --- ERROR HANDLER (Prevents Crashes) ---
+@client.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    # If the command is on cooldown (Rate Limit)
+    if isinstance(error, app_commands.CommandOnCooldown):
+        await interaction.response.send_message(f"⏳ **Take a breather!** Try again in {int(error.retry_after)}s.", ephemeral=True)
+    
+    # If the bot is missing permissions
+    elif isinstance(error, app_commands.BotMissingPermissions):
+        await interaction.response.send_message("❌ I don't have permission to do that here.", ephemeral=True)
+
+    # If the bot is "busy" or 429'd (Generic Error)
+    else:
+        print(f"⚠️ ERROR: {error}")
+        # Try to send a message if we haven't already (to stop 'Application not responding')
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message("⚠️ **System Busy:** Please wait a moment and try again.", ephemeral=True)
+        except:
+            pass
+
 print("System: Loading Proxima V16 (Help, Transfer Owner, Config Reset)...")
 if TOKEN:
     try:
+        # keep_alive() is crucial for 24/7 hosting
         keep_alive()
         client.run(TOKEN)
     except Exception as e:
