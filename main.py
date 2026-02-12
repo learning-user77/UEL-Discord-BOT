@@ -9,10 +9,25 @@ from keep_alive import keep_alive
 from PIL import Image, ImageDraw, ImageFont
 import io
 import aiohttp
+import urllib.request # To download font automatically
 
 # --- CONFIGURATION ---
 TOKEN = os.environ.get('TOKEN')
 DEFAULT_BG_FILE = "proxima_default.jpg" 
+
+# --- AUTO-DOWNLOAD FONT (No upload needed!) ---
+def check_and_download_font():
+    if not os.path.exists("font.ttf"):
+        print("System: Font missing. Downloading Roboto-Bold...")
+        try:
+            url = "https://github.com/google/fonts/raw/main/apache/roboto/Roboto-Bold.ttf"
+            urllib.request.urlretrieve(url, "font.ttf")
+            print("System: Font downloaded successfully!")
+        except Exception as e:
+            print(f"System: Could not download font. Text will be small. Error: {e}")
+
+# Call this immediately
+check_and_download_font()
 
 # --- DATABASE SETUP ---
 conn = sqlite3.connect('team_manager.db')
@@ -143,12 +158,12 @@ def format_roster_list(members, mgr_id, asst_id):
         formatted_list.append(name)
     return formatted_list
 
-# --- MASTER CARD GENERATOR ---
+# --- MASTER CARD GENERATOR (The "Smart" Version) ---
 async def generate_transaction_card(player, team_name, team_color, title_text="OFFICIAL SIGNING", custom_bg_url=None):
     W, H = 800, 400
     img = None
     
-    # 1. Custom URL
+    # 1. Try Custom URL (from /decorate_transactions)
     if custom_bg_url:
         try:
             async with aiohttp.ClientSession() as session:
@@ -157,32 +172,31 @@ async def generate_transaction_card(player, team_name, team_color, title_text="O
                         data = await resp.read()
                         bg_img = Image.open(io.BytesIO(data)).convert("RGB")
                         img = bg_img.resize((W, H))
+                        # Dark Overlay so text pops
                         overlay = Image.new("RGBA", (W, H), (0,0,0,0))
                         draw_overlay = ImageDraw.Draw(overlay)
                         draw_overlay.rectangle([(0, 240), (W, H)], fill=(0, 0, 0, 160))
                         img.paste(overlay, (0,0), mask=overlay)
         except: img = None
 
-    # 2. Local Default
+    # 2. Try Local File (If you ever upload one)
     if img is None and os.path.exists(DEFAULT_BG_FILE):
         try:
             bg_img = Image.open(DEFAULT_BG_FILE).convert("RGB")
             img = bg_img.resize((W, H))
-            overlay = Image.new("RGBA", (W, H), (0,0,0,0))
-            draw_overlay = ImageDraw.Draw(overlay)
-            draw_overlay.rectangle([(0, 240), (W, H)], fill=(0, 0, 0, 140))
-            img.paste(overlay, (0,0), mask=overlay)
         except: pass
 
-    # 3. Fallback Color
+    # 3. FALLBACK: This is what you want!
+    # If no image found, paint the background with the Team Color
     if img is None:
         bg_color = team_color.to_rgb()
+        # If color is default (black/transparent), make it Dark Grey
         if bg_color == (0, 0, 0): bg_color = (44, 47, 51)
         img = Image.new("RGB", (W, H), color=bg_color)
 
     draw = ImageDraw.Draw(img)
 
-    # 4. Avatar
+    # 4. Avatar (With Error Handling)
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(player.display_avatar.url) as resp:
@@ -190,24 +204,30 @@ async def generate_transaction_card(player, team_name, team_color, title_text="O
                     data = await resp.read()
                     avatar = Image.open(io.BytesIO(data)).convert("RGBA")
                     avatar = avatar.resize((200, 200))
+                    # Circular Mask
                     mask = Image.new("L", (200, 200), 0)
                     draw_mask = ImageDraw.Draw(mask)
                     draw_mask.ellipse((0, 0, 200, 200), fill=255)
                     img.paste(avatar, (300, 50), mask=mask)
+                    # Border
                     draw.ellipse((300, 50, 500, 250), outline="white", width=3)
-    except: pass 
+    except: 
+        pass # If avatar fails, just skip it
 
-    # 5. Text
+    # 5. Text (Auto-downloads font so it looks good)
     try:
         font_large = ImageFont.truetype("font.ttf", 60)
         font_small = ImageFont.truetype("font.ttf", 40)
     except:
+        # Emergency backup if download failed
         font_large = ImageFont.load_default()
         font_small = ImageFont.load_default()
 
+    # Draw Text
     draw.text((W/2, 290), title_text, fill="white", font=font_small, anchor="mm")
     draw.text((W/2, 350), player.name.upper(), fill="white", font=font_large, anchor="mm")
     
+    # Save to Buffer
     buffer = io.BytesIO()
     img.save(buffer, format="PNG")
     buffer.seek(0)
@@ -238,7 +258,7 @@ async def send_dm(user, content=None, embed=None, view=None):
     try: await user.send(content=content, embed=embed, view=view); return True
     except: return False
 
-# --- VIEWS (PAGINATION & CONFIRMATION) ---
+# --- VIEWS ---
 
 class TransferView(discord.ui.View):
     def __init__(self, guild, player, from_team, to_team, to_manager, logo):
@@ -763,10 +783,9 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         except:
             pass
 
-print("System: Loading Proxima V16 (Help, Transfer Owner, Config Reset)...")
+print("System: Loading Proxima V17 (Auto-Font Download)...")
 if TOKEN:
     try:
-        # keep_alive() is crucial for 24/7 hosting
         keep_alive()
         client.run(TOKEN)
     except Exception as e:
