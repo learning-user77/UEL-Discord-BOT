@@ -18,6 +18,9 @@ TOKEN = os.environ.get('TOKEN')
 DEFAULT_BG_FILE = "proxima_default.jpg"
 DB_PATH = "team_manager.db"
 
+# --- REPLACE THIS WITH YOUR DISCORD USER ID (right‑click your profile -> Copy ID) ---
+OWNER_ID = 123456789012345678  # <-- CHANGE THIS TO YOUR OWN ID
+
 # --- AUTO-DOWNLOAD FONT ---
 def check_and_download_font():
     if not os.path.exists("font.ttf"):
@@ -146,13 +149,6 @@ async def update_stat(user_id, stat_type, amount=1):
         elif stat_type == "demand":
             await db.execute("UPDATE player_stats SET demands = demands + ? WHERE user_id = ?", (amount, user_id))
         await db.commit()
-
-def find_user_team_sync(member):
-    """Synchronous helper to find a member's team (used in sync contexts, but we'll keep it sync)."""
-    for role in member.roles:
-        # Note: this calls get_team_data which is async, so we can't use it directly.
-        # We'll keep this as a placeholder and replace calls with an async version.
-        pass
 
 # We need an async version for use in commands
 async def find_user_team(member):
@@ -440,12 +436,24 @@ class LeagueBot(discord.Client):
         await init_db()  # initialize database on startup
 
     async def on_ready(self):
-        await self.tree.sync()
+        # REMOVED automatic global sync – now manual via /sync
         print(f"✅ LOGGED IN AS: {self.user}")
 
 client = LeagueBot()
 
 # --- COMMANDS (all now async and properly deferred) ---
+
+@client.tree.command(name="sync", description="Sync slash commands globally (owner only)")
+async def sync_commands(interaction: discord.Interaction):
+    """Owner-only command to sync the command tree globally."""
+    if interaction.user.id != OWNER_ID:
+        return await interaction.response.send_message("❌ You are not the bot owner.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    try:
+        await client.tree.sync()
+        await interaction.followup.send("✅ Commands synced globally!", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Sync failed: {e}", ephemeral=True)
 
 @client.tree.command(name="help", description="Show bot commands")
 async def help_command(interaction: discord.Interaction):
@@ -971,7 +979,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
             pass
 
 # --- STARTUP ---
-print("System: Loading Proxima V18 (Async DB, threaded images)...")
+print("System: Loading Proxima V19 (removed auto-sync, added /sync command)...")
 if TOKEN:
     try:
         keep_alive()
