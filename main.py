@@ -19,7 +19,7 @@ DEFAULT_BG_FILE = "proxima_default.jpg"
 DB_PATH = "team_manager.db"
 
 # --- REPLACE THIS WITH YOUR DISCORD USER ID (right‑click your profile -> Copy ID) ---
-OWNER_ID = 123456789012345678  # <-- CHANGE THIS TO YOUR OWN ID
+OWNER_ID = 925817680848617486  # <-- CHANGE THIS TO YOUR OWN ID
 
 # --- AUTO-DOWNLOAD FONT ---
 def check_and_download_font():
@@ -986,3 +986,4 @@ if TOKEN:
         client.run(TOKEN)
     except Exception as e:
         print(f"❌ Error: {e}")
+
