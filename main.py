@@ -150,6 +150,13 @@ async def update_stat(user_id, stat_type, amount=1):
             await db.execute("UPDATE player_stats SET demands = demands + ? WHERE user_id = ?", (amount, user_id))
         await db.commit()
 
+def find_user_team_sync(member):
+    """Synchronous helper to find a member's team (used in sync contexts, but we'll keep it sync)."""
+    for role in member.roles:
+        # Note: this calls get_team_data which is async, so we can't use it directly.
+        # We'll keep this as a placeholder and replace calls with an async version.
+        pass
+
 # We need an async version for use in commands
 async def find_user_team(member):
     for role in member.roles:
@@ -979,11 +986,10 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
             pass
 
 # --- STARTUP ---
-print("System: Loading Proxima V19 (removed auto-sync, added /sync command)...")
+print("System: Loading Proxima V19 (Async DB, threaded images, manual sync)...")
 if TOKEN:
     try:
         keep_alive()
         client.run(TOKEN)
     except Exception as e:
         print(f"❌ Error: {e}")
-
