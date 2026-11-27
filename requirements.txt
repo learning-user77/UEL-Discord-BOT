@@ -2,3 +2,4 @@ discord.py
 Pillow
 aiohttp
 Flask
+asyncpg
