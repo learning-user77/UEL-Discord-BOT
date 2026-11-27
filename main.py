@@ -1,10 +1,10 @@
 import discord
 from discord import app_commands
-import sqlite3
 import datetime
 import os
 import asyncio  # added for timeout handling
 from keep_alive import keep_alive
+import db
 
 # --- IMPORTS FOR IMAGE GENERATION ---
 from PIL import Image, ImageDraw, ImageFont
@@ -30,98 +30,26 @@ def check_and_download_font():
 # Call this immediately
 check_and_download_font()
 
-# --- DATABASE SETUP ---
-conn = sqlite3.connect('team_manager.db')
-c = conn.cursor()
-
-# 1. Global Settings
-c.execute("""CREATE TABLE IF NOT EXISTS global_config (
-             guild_id INTEGER PRIMARY KEY,
-             manager_role_id INTEGER,
-             asst_role_id INTEGER,
-             contract_channel_id INTEGER,
-             free_agent_role_id INTEGER,
-             window_open INTEGER DEFAULT 1,
-             demand_limit INTEGER DEFAULT 3
-             )""")
-
-# 2. Teams Table
-c.execute("""CREATE TABLE IF NOT EXISTS teams (
-             team_role_id INTEGER PRIMARY KEY,
-             logo TEXT,
-             roster_limit INTEGER,
-             transaction_image TEXT
-             )""")
-
-# 3. Free Agents
-c.execute("""CREATE TABLE IF NOT EXISTS free_agents (
-             user_id INTEGER PRIMARY KEY,
-             region TEXT,
-             position TEXT,
-             description TEXT,
-             timestamp TEXT
-             )""")
-
-# 4. Player Stats
-c.execute("""CREATE TABLE IF NOT EXISTS player_stats (
-             user_id INTEGER PRIMARY KEY,
-             transfers INTEGER DEFAULT 0,
-             demands INTEGER DEFAULT 0
-             )""")
-
-# --- DATABASE MIGRATIONS ---
-try:
-    c.execute("ALTER TABLE global_config ADD COLUMN free_agent_role_id INTEGER")
-except sqlite3.OperationalError:
-    pass
-try:
-    c.execute("ALTER TABLE global_config ADD COLUMN window_open INTEGER DEFAULT 1")
-except sqlite3.OperationalError:
-    pass
-try:
-    c.execute("ALTER TABLE teams ADD COLUMN transaction_image TEXT")
-except sqlite3.OperationalError:
-    pass
-try:
-    c.execute("ALTER TABLE global_config ADD COLUMN demand_limit INTEGER DEFAULT 3")
-except sqlite3.OperationalError:
-    pass
-conn.commit()
-
 # --- HELPER FUNCTIONS ---
 
-def get_global_config(guild_id):
-    c.execute("SELECT * FROM global_config WHERE guild_id = ?", (guild_id,))
-    return c.fetchone()
+async def get_global_config(guild_id):
+    return await db.get_global_config(guild_id)
 
-def get_team_data(role_id):
-    c.execute("SELECT * FROM teams WHERE team_role_id = ?", (role_id,))
-    return c.fetchone()
+async def get_team_data(role_id):
+    return await db.get_team_data(role_id)
 
-def get_all_teams():
-    c.execute("SELECT * FROM teams")
-    return c.fetchall()
+async def get_all_teams(guild_id):
+    return await db.get_all_teams(guild_id)
 
-def get_player_stats(user_id):
-    c.execute("SELECT * FROM player_stats WHERE user_id = ?", (user_id,))
-    data = c.fetchone()
-    if not data:
-        c.execute("INSERT INTO player_stats (user_id, transfers, demands) VALUES (?, 0, 0)", (user_id,))
-        conn.commit()
-        return (user_id, 0, 0)
-    return data
+async def get_player_stats(guild_id, user_id):
+    return await db.get_player_stats(guild_id, user_id)
 
-def update_stat(user_id, stat_type, amount=1):
-    get_player_stats(user_id)  # Ensure exists
-    if stat_type == "transfer":
-        c.execute("UPDATE player_stats SET transfers = transfers + ? WHERE user_id = ?", (amount, user_id))
-    elif stat_type == "demand":
-        c.execute("UPDATE player_stats SET demands = demands + ? WHERE user_id = ?", (amount, user_id))
-    conn.commit()
+async def update_stat(guild_id, user_id, stat_type, amount=1):
+    await db.update_stat(guild_id, user_id, stat_type, amount)
 
-def find_user_team(member):
+async def find_user_team(member):
     for role in member.roles:
-        data = get_team_data(role.id)
+        data = await get_team_data(role.id)
         if data:
             trans_img = data[3] if len(data) > 3 else None
             return (role, data[1], data[2], trans_img)
@@ -130,8 +58,8 @@ def find_user_team(member):
 def is_staff(interaction: discord.Interaction):
     return interaction.user.guild_permissions.administrator
 
-def is_window_open(guild_id):
-    config = get_global_config(guild_id)
+async def is_window_open(guild_id):
+    config = await get_global_config(guild_id)
     if not config:
         return True
     try:
@@ -139,8 +67,8 @@ def is_window_open(guild_id):
     except IndexError:
         return True
 
-def get_managers_of_team(guild, team_role):
-    config = get_global_config(guild.id)
+async def get_managers_of_team(guild, team_role):
+    config = await get_global_config(guild.id)
     if not config:
         return ([], [])
     mgr_id, asst_id = config[1], config[2]
@@ -154,9 +82,8 @@ def get_managers_of_team(guild, team_role):
     return (head_managers, assistants)
 
 async def cleanup_free_agent(guild, member):
-    c.execute("DELETE FROM free_agents WHERE user_id = ?", (member.id,))
-    conn.commit()
-    config = get_global_config(guild.id)
+    await db.delete_free_agent(guild.id, member.id)
+    config = await get_global_config(guild.id)
     if config and config[4]:
         role = guild.get_role(config[4])
         if role and role in member.roles:
@@ -271,7 +198,7 @@ def create_transaction_embed(guild, title, description, color, team_role, logo, 
     return embed
 
 async def send_to_channel(guild, embed, file=None):
-    config = get_global_config(guild.id)
+    config = await get_global_config(guild.id)
     if config and config[3]:
         channel = guild.get_channel(config[3])
         if channel:
@@ -300,7 +227,7 @@ class TransferView(discord.ui.View):
 
     @discord.ui.button(label="Accept Transfer", style=discord.ButtonStyle.green, emoji="✅")
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not is_window_open(self.guild.id):
+        if not await is_window_open(self.guild.id):
             return await interaction.response.send_message("❌ **Transfer Window is CLOSED.**", ephemeral=True)
 
         await interaction.response.defer()
@@ -313,11 +240,11 @@ class TransferView(discord.ui.View):
             await member.remove_roles(self.from_team)
             await member.add_roles(self.to_team)
             await cleanup_free_agent(self.guild, member)
-            update_stat(member.id, "transfer")
+            await update_stat(self.guild.id, member.id, "transfer")
 
             desc = f"🚨 **TRANSFER NEWS** 🚨\n\n{member.mention} has been transferred\nFrom: {self.from_team.mention}\nTo: {self.to_team.mention}"
 
-            data = get_team_data(self.to_team.id)
+            data = await get_team_data(self.to_team.id)
             limit = data[2] if data else 0
             custom_bg = data[3] if data and len(data) > 3 else None
 
@@ -376,9 +303,7 @@ class ResetView(discord.ui.View):
 
     @discord.ui.button(label="⚠️ CONFIRM WIPE", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Delete Config
-        c.execute("DELETE FROM global_config WHERE guild_id = ?", (self.guild_id,))
-        conn.commit()
+        await db.delete_global_config(self.guild_id)
         await interaction.response.edit_message(content="✅ **Configuration Wiped.** Please run `/setup_global` again.", view=None, embed=None)
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
@@ -391,8 +316,16 @@ class LeagueBot(discord.Client):
         super().__init__(intents=discord.Intents.all())
         self.tree = app_commands.CommandTree(self)
 
-    async def on_ready(self):
+    async def setup_hook(self):
+        await db.init_db()
+        print("✅ Connected to PostgreSQL database.")
         await self.tree.sync()
+
+    async def close(self):
+        await db.close_db()
+        await super().close()
+
+    async def on_ready(self):
         print(f"✅ LOGGED IN AS: {self.user}")
 
 client = LeagueBot()
@@ -401,7 +334,7 @@ client = LeagueBot()
 @client.tree.command(name="leave_other_servers", description="[OWNER ONLY] Makes the bot leave all other servers.")
 async def leave_other_servers(interaction: discord.Interaction):
     # SECURITY: Replace this number with your actual Discord User ID!
-    OWNER_ID = 925817680848617486
+    OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
 
     if interaction.user.id != OWNER_ID:
         await interaction.response.send_message("❌ **Access Denied:** You are not the bot owner.", ephemeral=True)
@@ -454,7 +387,7 @@ async def help_command(interaction: discord.Interaction):
 
 @client.tree.command(name="tm_transfer", description="Transfer Team Ownership to another player")
 async def tm_transfer(interaction: discord.Interaction, player: discord.Member):
-    g_config = get_global_config(interaction.guild.id)
+    g_config = await get_global_config(interaction.guild.id)
     if not g_config:
         return await interaction.response.send_message("❌ Config not set.", ephemeral=True)
 
@@ -467,7 +400,7 @@ async def tm_transfer(interaction: discord.Interaction, player: discord.Member):
     if mgr_role not in interaction.user.roles:
         return await interaction.response.send_message("❌ You are not a Team Manager.", ephemeral=True)
 
-    team_info = find_user_team(interaction.user)
+    team_info = await find_user_team(interaction.user)
     if not team_info:
         return await interaction.response.send_message("❌ You don't have a team.", ephemeral=True)
     team_role = team_info[0]
@@ -495,32 +428,36 @@ async def reset_config(interaction: discord.Interaction):
 async def setup_global(interaction: discord.Interaction, manager_role: discord.Role, asst_role: discord.Role, free_agent_role: discord.Role, channel: discord.TextChannel, demand_limit: int = 3):
     if not is_staff(interaction):
         return await interaction.response.send_message("❌ Admin Only", ephemeral=True)
-    current_config = get_global_config(interaction.guild.id)
+    current_config = await get_global_config(interaction.guild.id)
     window_state = 1
     if current_config and len(current_config) > 5:
         window_state = current_config[5]
 
-    c.execute("INSERT OR REPLACE INTO global_config VALUES (?, ?, ?, ?, ?, ?, ?)",
-              (interaction.guild.id, manager_role.id, asst_role.id, channel.id, free_agent_role.id, window_state, demand_limit))
-    conn.commit()
+    await db.upsert_global_config(
+        interaction.guild.id,
+        manager_role.id,
+        asst_role.id,
+        channel.id,
+        free_agent_role.id,
+        window_state,
+        demand_limit,
+    )
     await interaction.response.send_message(f"✅ **Config Saved!** (Demand Limit: {demand_limit})", ephemeral=True)
 
 @client.tree.command(name="setup_team", description="Register a Team Role")
 async def setup_team(interaction: discord.Interaction, team_role: discord.Role, logo: str, roster_limit: int = 20):
     if not is_staff(interaction):
         return await interaction.response.send_message("❌ Admin Only", ephemeral=True)
-    existing = get_team_data(team_role.id)
+    existing = await get_team_data(team_role.id)
     trans_img = existing[3] if existing and len(existing) > 3 else None
-    c.execute("INSERT OR REPLACE INTO teams VALUES (?, ?, ?, ?)", (team_role.id, logo, roster_limit, trans_img))
-    conn.commit()
+    await db.upsert_team(team_role.id, interaction.guild.id, logo, roster_limit, trans_img)
     await interaction.response.send_message(f"✅ **{team_role.name}** registered!", ephemeral=True)
 
 @client.tree.command(name="team_delete", description="Unregister a team")
 async def team_delete(interaction: discord.Interaction, team_role: discord.Role):
     if not is_staff(interaction):
         return await interaction.response.send_message("❌ Admin Only", ephemeral=True)
-    c.execute("DELETE FROM teams WHERE team_role_id = ?", (team_role.id,))
-    conn.commit()
+    await db.delete_team(team_role.id)
     await interaction.response.send_message(f"🗑️ **{team_role.name}** removed.", ephemeral=True)
 
 @client.tree.command(name="window", description="Open/Close Window")
@@ -528,11 +465,10 @@ async def team_delete(interaction: discord.Interaction, team_role: discord.Role)
 async def window(interaction: discord.Interaction, status: int):
     if not is_staff(interaction):
         return await interaction.response.send_message("❌ Admin Only", ephemeral=True)
-    c.execute("UPDATE global_config SET window_open = ? WHERE guild_id = ?", (status, interaction.guild.id))
-    conn.commit()
+    await db.set_window_open(interaction.guild.id, status)
     msg = "✅ **Transfer Window OPEN!**" if status == 1 else "❌ **Transfer Window CLOSED!**"
     await interaction.response.send_message(msg)
-    conf = get_global_config(interaction.guild.id)
+    conf = await get_global_config(interaction.guild.id)
     if conf and conf[3]:
         chan = interaction.guild.get_channel(conf[3])
         if chan:
@@ -540,24 +476,25 @@ async def window(interaction: discord.Interaction, status: int):
 
 @client.tree.command(name="decorate_transactions", description="Set custom contract background (Upload Image OR Link)")
 async def decorate_transactions(interaction: discord.Interaction, image_file: discord.Attachment = None, url: str = None):
-    g_config = get_global_config(interaction.guild.id)
+    g_config = await get_global_config(interaction.guild.id)
+    if not g_config:
+        return await interaction.response.send_message("❌ Config not set. Run `/setup_global` first.", ephemeral=True)
     user_roles = [r.id for r in interaction.user.roles]
     if (g_config[1] not in user_roles) and (g_config[2] not in user_roles) and not interaction.user.guild_permissions.administrator:
         return await interaction.response.send_message("❌ Managers or Admins only.", ephemeral=True)
 
-    team_info = find_user_team(interaction.user)
+    team_info = await find_user_team(interaction.user)
     if not team_info:
         return await interaction.response.send_message("❌ You aren't managing a team.", ephemeral=True)
     team_role, _, _, _ = team_info
 
     final_url = None
     if url and url.lower() in ["reset", "none", "remove"]:
-        c.execute("UPDATE teams SET transaction_image = NULL WHERE team_role_id = ?", (team_role.id,))
-        conn.commit()
+        await db.set_team_transaction_image(team_role.id, None)
         return await interaction.response.send_message(f"✅ **{team_role.name}** reverted to Proxima Default.")
 
     if image_file:
-        if not image_file.content_type.startswith("image/"):
+        if not image_file.content_type or not image_file.content_type.startswith("image/"):
             return await interaction.response.send_message("❌ File must be an image.", ephemeral=True)
         final_url = image_file.url
     elif url:
@@ -567,8 +504,7 @@ async def decorate_transactions(interaction: discord.Interaction, image_file: di
     else:
         return await interaction.response.send_message("❌ Provide an **Image File** OR a **URL**.", ephemeral=True)
 
-    c.execute("UPDATE teams SET transaction_image = ? WHERE team_role_id = ?", (final_url, team_role.id))
-    conn.commit()
+    await db.set_team_transaction_image(team_role.id, final_url)
     embed = discord.Embed(title="Background Updated", description="Your future signings will look like this:", color=discord.Color.green())
     embed.set_image(url=final_url)
     await interaction.response.send_message(f"✅ **{team_role.name}** custom background set!", embed=embed, ephemeral=True)
@@ -577,29 +513,31 @@ async def decorate_transactions(interaction: discord.Interaction, image_file: di
 async def sign(interaction: discord.Interaction, player: discord.Member):
     await interaction.response.defer()
 
-    if not is_window_open(interaction.guild.id):
+    if not await is_window_open(interaction.guild.id):
         return await interaction.followup.send("❌ **Window Closed.**")
 
-    g_config = get_global_config(interaction.guild.id)
+    g_config = await get_global_config(interaction.guild.id)
+    if not g_config:
+        return await interaction.followup.send("❌ Config not set. Run `/setup_global` first.")
     user_roles = [r.id for r in interaction.user.roles]
     if (g_config[1] not in user_roles) and (g_config[2] not in user_roles):
         return await interaction.followup.send("❌ Not Authorized.")
 
-    team_info = find_user_team(interaction.user)
+    team_info = await find_user_team(interaction.user)
     if not team_info:
         return await interaction.followup.send("❌ No team role.")
     team_role, logo, limit, custom_bg = team_info
 
     if team_role in player.roles:
         return await interaction.followup.send("⚠️ Already on team.")
-    if find_user_team(player):
+    if await find_user_team(player):
         return await interaction.followup.send("🚫 Player on another team. Use `/transfer`.")
     if len(team_role.members) >= limit:
         return await interaction.followup.send("❌ Roster Full!")
 
     await player.add_roles(team_role)
     await cleanup_free_agent(interaction.guild, player)
-    update_stat(player.id, "transfer")
+    await update_stat(interaction.guild.id, player.id, "transfer")
 
     desc = f"The {team_role.mention} have **signed** {player.mention}"
     embed = create_transaction_embed(interaction.guild, f"{team_role.name} Transaction", desc, discord.Color.blue(), team_role, logo, interaction.user, len(team_role.members), limit)
@@ -617,10 +555,10 @@ async def sign(interaction: discord.Interaction, player: discord.Member):
 
 @client.tree.command(name="release", description="Release a player")
 async def release(interaction: discord.Interaction, player: discord.Member):
-    if not is_window_open(interaction.guild.id):
+    if not await is_window_open(interaction.guild.id):
         return await interaction.response.send_message("❌ Window Closed.", ephemeral=True)
 
-    team_info = find_user_team(interaction.user)
+    team_info = await find_user_team(interaction.user)
     if not team_info:
         return await interaction.response.send_message("❌ No team.", ephemeral=True)
     team_role, logo, limit, custom_bg = team_info
@@ -644,26 +582,25 @@ async def release(interaction: discord.Interaction, player: discord.Member):
 
 @client.tree.command(name="demand", description="Leave your current team (Uses Demand Limit)")
 async def demand(interaction: discord.Interaction):
-    team_info = find_user_team(interaction.user)
+    team_info = await find_user_team(interaction.user)
     if not team_info:
         return await interaction.response.send_message("❌ Not in a team.", ephemeral=True)
     team_role, logo, limit, _ = team_info
 
-    g_conf = get_global_config(interaction.guild.id)
+    g_conf = await get_global_config(interaction.guild.id)
     demand_limit = g_conf[6] if g_conf and len(g_conf) > 6 else 3
-    stats = get_player_stats(interaction.user.id)
+    stats = await get_player_stats(interaction.guild.id, interaction.user.id)
     demands_used = stats[2]
 
     if demands_used >= demand_limit:
         return await interaction.response.send_message(f"🚫 **Demand Limit Reached!** ({demands_used}/{demand_limit})\nYou cannot leave your team.", ephemeral=True)
 
     await interaction.user.remove_roles(team_role)
-    update_stat(interaction.user.id, "demand")
+    await update_stat(interaction.guild.id, interaction.user.id, "demand")
     demands_left = demand_limit - (demands_used + 1)
 
-    config = get_global_config(interaction.guild.id)
-    if config and config[4]:
-        fa_role = interaction.guild.get_role(config[4])
+    if g_conf and g_conf[4]:
+        fa_role = interaction.guild.get_role(g_conf[4])
         if fa_role:
             await interaction.user.add_roles(fa_role)
 
@@ -671,19 +608,21 @@ async def demand(interaction: discord.Interaction):
     embed = create_transaction_embed(interaction.guild, "Transfer Demand", desc, discord.Color.dark_grey(), team_role, logo, None, len(team_role.members), limit)
     await send_to_channel(interaction.guild, embed)
 
-    heads, assts = get_managers_of_team(interaction.guild, team_role)
+    heads, assts = await get_managers_of_team(interaction.guild, team_role)
     for mgr in heads + assts:
         await send_dm(mgr, content=f"📢 {interaction.user.name} has left your team.")
     await interaction.response.send_message(f"👋 Left **{team_role.name}**.\nDemands remaining: {demands_left}", ephemeral=True)
 
 @client.tree.command(name="promote", description="Promote a player to Assistant Manager")
 async def promote(interaction: discord.Interaction, player: discord.Member):
-    g_config = get_global_config(interaction.guild.id)
+    g_config = await get_global_config(interaction.guild.id)
+    if not g_config:
+        return await interaction.response.send_message("❌ Config not set. Run `/setup_global` first.", ephemeral=True)
     user_roles = [r.id for r in interaction.user.roles]
     if g_config[1] not in user_roles and not interaction.user.guild_permissions.administrator:
         return await interaction.response.send_message("❌ Head Managers only.", ephemeral=True)
 
-    team_info = find_user_team(interaction.user)
+    team_info = await find_user_team(interaction.user)
     if not team_info:
         return await interaction.response.send_message("❌ You aren't managing a team.", ephemeral=True)
     team_role = team_info[0]
@@ -704,8 +643,7 @@ async def transfer_list(interaction: discord.Interaction):
     if not is_staff(interaction):
         return await interaction.response.send_message("❌ Admin Only", ephemeral=True)
 
-    c.execute("SELECT user_id, transfers FROM player_stats ORDER BY transfers DESC LIMIT 15")
-    data = c.fetchall()
+    data = await db.get_top_transfers(interaction.guild.id, limit=15)
 
     if not data:
         return await interaction.response.send_message("No transfer history found.", ephemeral=True)
@@ -724,9 +662,15 @@ async def transfer_list(interaction: discord.Interaction):
 @app_commands.choices(region=[app_commands.Choice(name="Asia", value="ASIA"), app_commands.Choice(name="Europe", value="EU"), app_commands.Choice(name="NA", value="NA"), app_commands.Choice(name="SA", value="SA")],
                       position=[app_commands.Choice(name="ST", value="ST"), app_commands.Choice(name="MF", value="MF"), app_commands.Choice(name="DF", value="DF"), app_commands.Choice(name="GK", value="GK")])
 async def looking_for_team(interaction: discord.Interaction, region: str, position: str, description: str):
-    c.execute("INSERT OR REPLACE INTO free_agents VALUES (?, ?, ?, ?, ?)", (interaction.user.id, region, position, description, str(datetime.datetime.now())))
-    conn.commit()
-    config = get_global_config(interaction.guild.id)
+    await db.upsert_free_agent(
+        interaction.guild.id,
+        interaction.user.id,
+        region,
+        position,
+        description,
+        str(datetime.datetime.now()),
+    )
+    config = await get_global_config(interaction.guild.id)
     if config and config[4]:
         role = interaction.guild.get_role(config[4])
         if role:
@@ -736,8 +680,7 @@ async def looking_for_team(interaction: discord.Interaction, region: str, positi
 @client.tree.command(name="free_agents", description="View available players")
 async def free_agents(interaction: discord.Interaction):
     await interaction.response.defer()
-    c.execute("SELECT * FROM free_agents")
-    agents = c.fetchall()
+    agents = await db.get_free_agents(interaction.guild.id)
     if not agents:
         return await interaction.followup.send("🤷‍♂️ No Free Agents currently listed.")
     embed = discord.Embed(title="📄 Free Agency Market", color=discord.Color.teal())
@@ -759,11 +702,11 @@ async def team_list(interaction: discord.Interaction):
         return await interaction.response.send_message("❌ Admin Only", ephemeral=True)
     await interaction.response.defer()
 
-    g_conf = get_global_config(interaction.guild.id)
+    g_conf = await get_global_config(interaction.guild.id)
     mgr_id = g_conf[1] if g_conf else 0
     asst_id = g_conf[2] if g_conf else 0
 
-    all_teams = get_all_teams()
+    all_teams = await get_all_teams(interaction.guild.id)
     if not all_teams:
         return await interaction.followup.send("❌ No teams.")
     embed = discord.Embed(title="🏆 Registered Teams List", color=discord.Color.gold())
@@ -781,10 +724,10 @@ async def team_list(interaction: discord.Interaction):
 
 @client.tree.command(name="team_view", description="View a specific team's roster")
 async def team_view(interaction: discord.Interaction, team: discord.Role):
-    data = get_team_data(team.id)
+    data = await get_team_data(team.id)
     if not data:
         return await interaction.response.send_message("❌ Not a registered team.", ephemeral=True)
-    g_conf = get_global_config(interaction.guild.id)
+    g_conf = await get_global_config(interaction.guild.id)
     mgr_id = g_conf[1] if g_conf else 0
     asst_id = g_conf[2] if g_conf else 0
     logo = data[1]
@@ -800,14 +743,14 @@ async def team_view(interaction: discord.Interaction, team: discord.Role):
 
 @client.tree.command(name="transfer", description="Request to sign a player")
 async def transfer(interaction: discord.Interaction, player: discord.Member):
-    if not is_window_open(interaction.guild.id):
+    if not await is_window_open(interaction.guild.id):
         return await interaction.response.send_message("❌ **Window CLOSED.**", ephemeral=True)
-    my_team_info = find_user_team(interaction.user)
+    my_team_info = await find_user_team(interaction.user)
     if not my_team_info:
         return await interaction.response.send_message("❌ Not a manager.", ephemeral=True)
     my_team_role, my_logo, _, _ = my_team_info
 
-    target_team_info = find_user_team(player)
+    target_team_info = await find_user_team(player)
     if not target_team_info:
         return await interaction.response.send_message("⚠️ Player not on a team.", ephemeral=True)
     target_team_role, _, _, _ = target_team_info
@@ -815,7 +758,7 @@ async def transfer(interaction: discord.Interaction, player: discord.Member):
     if my_team_role.id == target_team_role.id:
         return await interaction.response.send_message("⚠️ Already on your team!", ephemeral=True)
 
-    heads, assts = get_managers_of_team(interaction.guild, target_team_role)
+    heads, assts = await get_managers_of_team(interaction.guild, target_team_role)
     target_manager = heads[0] if heads else (assts[0] if assts else None)
     if not target_manager:
         return await interaction.response.send_message(f"❌ **{target_team_role.name}** has no active Manager.", ephemeral=True)
@@ -857,7 +800,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
             pass
 
 # --- STARTUP ---
-print("System: Loading Proxima V17 (Auto-Font Download)...")
+print("System: Loading Proxima V18 (Neon PostgreSQL Async Pool)...")
 if TOKEN:
     try:
         keep_alive()
